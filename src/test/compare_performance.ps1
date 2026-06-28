@@ -2,8 +2,8 @@
 .SYNOPSIS
     Честное сравнение производительности Quarkus и Spring Boot
 .DESCRIPTION
-    Запускает оба приложения одновременно, измеряет время запуска и потребление памяти до и после запросов,
-    выполняет тестовые запросы и завершает процессы.
+    Запускает оба приложения одновременно, измеряет время запуска JVM (из логов)
+    и время до первого HTTP-ответа, выполняет тестовые запросы и завершает процессы.
 #>
 
 # --- Конфигурация ---
@@ -49,20 +49,6 @@ function Clear-Ports {
     Log-Success "Порты очищены"
 }
 
-function Clear-SystemCache {
-    Log-Start "Очистка системного кэша (требует прав администратора)..."
-    try {
-        # Сброс кэша файловой системы
-        if (-not (Test-Path "C:\temp")) { New-Item -ItemType Directory -Path "C:\temp" -Force | Out-Null }
-        [System.IO.File]::WriteAllText("C:\temp\clear_cache.txt", "3")
-        Start-Process -FilePath "cmd.exe" -ArgumentList "/c echo 3 > C:\temp\clear_cache.txt" -WindowStyle Hidden -Wait
-        Log-Success "Системный кэш очищен"
-    } catch {
-        Log-Error "Не удалось очистить кэш: $($_.Exception.Message)"
-        Log-Start "Продолжаем без очистки кэша"
-    }
-}
-
 function Get-ProcessMemory {
     param([string]$ProcessName)
     $process = Get-WmiObject Win32_Process | Where-Object {
@@ -97,6 +83,25 @@ function Start-App {
     return $process
 }
 
+function Parse-StartupTime {
+    param([string]$LogFile, [string]$Name)
+    $content = Get-Content $LogFile -ErrorAction SilentlyContinue
+    if (-not $content) { return $null }
+
+    if ($Name -eq "Quarkus") {
+        $match = $content | Select-String -Pattern "started in ([\d.]+)s" | Select-Object -First 1
+        if ($match) {
+            return [math]::round([double]$match.Matches.Groups[1].Value * 1000, 2)
+        }
+    } elseif ($Name -eq "Spring") {
+        $match = $content | Select-String -Pattern "Started .+ in ([\d.]+) seconds" | Select-Object -First 1
+        if ($match) {
+            return [math]::round([double]$match.Matches.Groups[1].Value * 1000, 2)
+        }
+    }
+    return $null
+}
+
 function Test-Endpoint {
     param([string]$Name, [int]$Port)
     $url = "http://localhost:$Port$TestEndpoint"
@@ -114,7 +119,8 @@ function Show-Results {
         $QuarkusData, $SpringData,
         $QuarkusResponse, $SpringResponse,
         $QuarkusMemBefore, $SpringMemBefore,
-        $QuarkusMemAfter, $SpringMemAfter
+        $QuarkusMemAfter, $SpringMemAfter,
+        $QuarkusStartupFromLog, $SpringStartupFromLog
     )
     Clear-Host
     Write-Host "==========================================" -ForegroundColor Magenta
@@ -125,33 +131,62 @@ function Show-Results {
     if ($QuarkusData -and $SpringData) {
         Write-Host "ПАРАМЕТРЫ ЗАПУСКА (запущены одновременно):" -ForegroundColor Yellow
         Write-Host ""
-        Write-Host "  Quarkus:  Время: $($QuarkusData.StartupTime) мс | Память после старта: $($QuarkusData.MemoryMB) МБ" -ForegroundColor Green
-        Write-Host "  Spring:   Время: $($SpringData.StartupTime) мс | Память после старта: $($SpringData.MemoryMB) МБ" -ForegroundColor Green
+
+        # Время из логов
+        $quarkusLogTime = if ($QuarkusStartupFromLog) { "$QuarkusStartupFromLog мс" } else { "N/A" }
+        $springLogTime = if ($SpringStartupFromLog) { "$SpringStartupFromLog мс" } else { "N/A" }
+
+        Write-Host "  Время старта JVM (из логов):" -ForegroundColor Cyan
+        Write-Host "    Quarkus:  $quarkusLogTime" -ForegroundColor Green
+        Write-Host "    Spring:   $springLogTime" -ForegroundColor Green
         Write-Host ""
 
+        # Время до первого HTTP-ответа
+        Write-Host "  Время до первого HTTP-ответа (скрипт):" -ForegroundColor Cyan
+        Write-Host "    Quarkus:  $($QuarkusData.StartupTime) мс" -ForegroundColor Green
+        Write-Host "    Spring:   $($SpringData.StartupTime) мс" -ForegroundColor Green
+        Write-Host ""
+
+        # Сравнение времени старта JVM
+        if ($QuarkusStartupFromLog -and $SpringStartupFromLog) {
+            if ($QuarkusStartupFromLog -lt $SpringStartupFromLog) {
+                $diffMs = $SpringStartupFromLog - $QuarkusStartupFromLog
+                $timesFaster = [math]::round($SpringStartupFromLog / $QuarkusStartupFromLog, 2)
+                $percentFaster = [math]::round(($diffMs / $SpringStartupFromLog) * 100, 1)
+                Write-Host "✅ JVM Quarkus стартует быстрее Spring в $timesFaster раза (на $percentFaster%)" -ForegroundColor Green
+            } else {
+                $diffMs = $QuarkusStartupFromLog - $SpringStartupFromLog
+                $timesSlower = [math]::round($QuarkusStartupFromLog / $SpringStartupFromLog, 2)
+                $percentSlower = [math]::round(($diffMs / $QuarkusStartupFromLog) * 100, 1)
+                Write-Host "⚠️ JVM Spring стартует быстрее Quarkus в $timesSlower раза (на $percentSlower%)" -ForegroundColor Yellow
+            }
+        }
+
+        # Сравнение времени до HTTP-ответа
         if ($QuarkusData.StartupTime -lt $SpringData.StartupTime) {
             $diffMs = $SpringData.StartupTime - $QuarkusData.StartupTime
             $timesFaster = [math]::round($SpringData.StartupTime / $QuarkusData.StartupTime, 2)
             $percentFaster = [math]::round(($diffMs / $SpringData.StartupTime) * 100, 1)
-            Write-Host "✅ Приложение Quarkus запускается быстрее Spring в $timesFaster раза (на $percentFaster%)" -ForegroundColor Green
+            Write-Host "✅ HTTP Quarkus отвечает быстрее Spring в $timesFaster раза (на $percentFaster%)" -ForegroundColor Green
         } else {
             $diffMs = $QuarkusData.StartupTime - $SpringData.StartupTime
             $timesSlower = [math]::round($QuarkusData.StartupTime / $SpringData.StartupTime, 2)
             $percentSlower = [math]::round(($diffMs / $QuarkusData.StartupTime) * 100, 1)
-            Write-Host "⚠️ Приложение Spring запускается быстрее Quarkus в $timesSlower раза (на $percentSlower%)" -ForegroundColor Yellow
+            Write-Host "⚠️ HTTP Spring отвечает быстрее Quarkus в $timesSlower раза (на $percentSlower%)" -ForegroundColor Yellow
         }
 
+        # Память
         if ($QuarkusData.MemoryMB -and $SpringData.MemoryMB) {
             if ($QuarkusData.MemoryMB -lt $SpringData.MemoryMB) {
                 $diffMem = [math]::round($SpringData.MemoryMB - $QuarkusData.MemoryMB, 2)
                 $timesLess = [math]::round($SpringData.MemoryMB / $QuarkusData.MemoryMB, 2)
                 $percentLess = [math]::round(($diffMem / $SpringData.MemoryMB) * 100, 1)
-                Write-Host "✅ Приложение Quarkus потребляет в $timesLess раза меньше памяти (на $percentLess%)" -ForegroundColor Green
+                Write-Host "✅ Quarkus потребляет в $timesLess раза меньше памяти (на $percentLess%)" -ForegroundColor Green
             } else {
                 $diffMem = [math]::round($QuarkusData.MemoryMB - $SpringData.MemoryMB, 2)
                 $timesLess = [math]::round($QuarkusData.MemoryMB / $SpringData.MemoryMB, 2)
                 $percentLess = [math]::round(($diffMem / $QuarkusData.MemoryMB) * 100, 1)
-                Write-Host "⚠️ Приложение Spring потребляет в $timesLess раза меньше памяти (на $percentLess%)" -ForegroundColor Yellow
+                Write-Host "⚠️ Spring потребляет в $timesLess раза меньше памяти (на $percentLess%)" -ForegroundColor Yellow
             }
         }
         Write-Host ""
@@ -200,12 +235,12 @@ function Show-Results {
                 $diffMemAfter = [math]::round($SpringMemAfter - $QuarkusMemAfter, 2)
                 $timesLessAfter = [math]::round($SpringMemAfter / $QuarkusMemAfter, 2)
                 $percentLessAfter = [math]::round(($diffMemAfter / $SpringMemAfter) * 100, 1)
-                Write-Host "✅ Приложение Quarkus после запросов потребляет в $timesLessAfter раза меньше памяти (на $percentLessAfter%)" -ForegroundColor Green
+                Write-Host "✅ Quarkus после запросов потребляет в $timesLessAfter раза меньше памяти (на $percentLessAfter%)" -ForegroundColor Green
             } else {
                 $diffMemAfter = [math]::round($QuarkusMemAfter - $SpringMemAfter, 2)
                 $timesLessAfter = [math]::round($QuarkusMemAfter / $SpringMemAfter, 2)
                 $percentLessAfter = [math]::round(($diffMemAfter / $QuarkusMemAfter) * 100, 1)
-                Write-Host "⚠️ Приложение Spring после запросов потребляет в $timesLessAfter раза меньше памяти (на $percentLessAfter%)" -ForegroundColor Yellow
+                Write-Host "⚠️ Spring после запросов потребляет в $timesLessAfter раза меньше памяти (на $percentLessAfter%)" -ForegroundColor Yellow
             }
         }
         Write-Host ""
@@ -237,14 +272,10 @@ function Main {
     $quarkusResponse = $null; $springResponse = $null
     $quarkusMemBefore = $null; $springMemBefore = $null
     $quarkusMemAfter = $null; $springMemAfter = $null
+    $quarkusStartupFromLog = $null; $springStartupFromLog = $null
 
     try {
-        # Очистка портов и кэша
         Clear-Ports
-
-        # Очистка системного кэша (раскомментируйте если есть права администратора)
-        # Clear-SystemCache
-
         $logDir = Join-Path $PSScriptRoot "logs"
         if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
         $quarkusLog = Join-Path $logDir "quarkus.log"
@@ -259,8 +290,9 @@ function Main {
             return
         }
 
-        Log-Start "Измерение времени старта и памяти..."
+        Log-Start "Ожидание старта серверов..."
 
+        # Ждём, пока серверы начнут отвечать
         $quarkusStartTime = Get-Date
         $quarkusReady = Wait-For-Server -Url "http://localhost:$QuarkusPort$TestEndpoint"
         $quarkusEndTime = Get-Date
@@ -269,18 +301,22 @@ function Main {
         $springReady = Wait-For-Server -Url "http://localhost:$SpringPort$TestEndpoint"
         $springEndTime = Get-Date
 
+        # Парсим время старта JVM из логов
+        $quarkusStartupFromLog = Parse-StartupTime -LogFile $quarkusLog -Name "Quarkus"
+        $springStartupFromLog = Parse-StartupTime -LogFile $springLog -Name "Spring"
+
         if ($quarkusReady) {
             $quarkusStartupTime = [math]::round(($quarkusEndTime - $quarkusStartTime).TotalMilliseconds, 2)
             $quarkusMemory = Get-ProcessMemory -ProcessName "quarkus"
             $quarkusData = @{ Process = $quarkusProcess; StartupTime = $quarkusStartupTime; MemoryMB = $quarkusMemory; Port = $QuarkusPort; Name = "Quarkus" }
-            Log-Success "Quarkus запущен за $quarkusStartupTime мс, память: $($quarkusMemory) МБ"
+            Log-Success "Quarkus: HTTP-ответ за $quarkusStartupTime мс | JVM-старт: $quarkusStartupFromLog мс | Память: $($quarkusMemory) МБ"
         } else { Log-Error "Quarkus не запустился за отведённое время" }
 
         if ($springReady) {
             $springStartupTime = [math]::round(($springEndTime - $springStartTime).TotalMilliseconds, 2)
             $springMemory = Get-ProcessMemory -ProcessName "spring"
             $springData = @{ Process = $springProcess; StartupTime = $springStartupTime; MemoryMB = $springMemory; Port = $SpringPort; Name = "Spring Boot" }
-            Log-Success "Spring Boot запущен за $springStartupTime мс, память: $($springMemory) МБ"
+            Log-Success "Spring: HTTP-ответ за $springStartupTime мс | JVM-старт: $springStartupFromLog мс | Память: $($springMemory) МБ"
         } else { Log-Error "Spring Boot не запустился за отведённое время" }
 
         # Память до запросов
@@ -305,7 +341,7 @@ function Main {
         $springMemAfter = Get-ProcessMemory -ProcessName "spring"
         Log-Start "Память после запросов: Quarkus = $quarkusMemAfter МБ, Spring = $springMemAfter МБ"
 
-        Show-Results -QuarkusData $quarkusData -SpringData $springData -QuarkusResponse $quarkusResponse -SpringResponse $springResponse -QuarkusMemBefore $quarkusMemBefore -SpringMemBefore $springMemBefore -QuarkusMemAfter $quarkusMemAfter -SpringMemAfter $springMemAfter
+        Show-Results -QuarkusData $quarkusData -SpringData $springData -QuarkusResponse $quarkusResponse -SpringResponse $springResponse -QuarkusMemBefore $quarkusMemBefore -SpringMemBefore $springMemBefore -QuarkusMemAfter $quarkusMemAfter -SpringMemAfter $springMemAfter -QuarkusStartupFromLog $quarkusStartupFromLog -SpringStartupFromLog $springStartupFromLog
         Read-Host
         Stop-Applications -QuarkusProcess $quarkusProcess -SpringProcess $springProcess
 

@@ -49,6 +49,20 @@ function Clear-Ports {
     Log-Success "Порты очищены"
 }
 
+function Clear-SystemCache {
+    Log-Start "Очистка системного кэша (требует прав администратора)..."
+    try {
+        # Сброс кэша файловой системы
+        if (-not (Test-Path "C:\temp")) { New-Item -ItemType Directory -Path "C:\temp" -Force | Out-Null }
+        [System.IO.File]::WriteAllText("C:\temp\clear_cache.txt", "3")
+        Start-Process -FilePath "cmd.exe" -ArgumentList "/c echo 3 > C:\temp\clear_cache.txt" -WindowStyle Hidden -Wait
+        Log-Success "Системный кэш очищен"
+    } catch {
+        Log-Error "Не удалось очистить кэш: $($_.Exception.Message)"
+        Log-Start "Продолжаем без очистки кэша"
+    }
+}
+
 function Get-ProcessMemory {
     param([string]$ProcessName)
     $process = Get-WmiObject Win32_Process | Where-Object {
@@ -225,7 +239,12 @@ function Main {
     $quarkusMemAfter = $null; $springMemAfter = $null
 
     try {
+        # Очистка портов и кэша
         Clear-Ports
+
+        # Очистка системного кэша (раскомментируйте если есть права администратора)
+        # Clear-SystemCache
+
         $logDir = Join-Path $PSScriptRoot "logs"
         if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
         $quarkusLog = Join-Path $logDir "quarkus.log"
